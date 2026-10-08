@@ -48,8 +48,15 @@ def convert(source: str, out_dir: str, num_experts: int, top_k: int):
     model = CortexMoeForCausalLM(config)
 
     state = gpt2.state_dict()
+    # transformers >= 5 exposes keys with the "transformer." prefix
+    state = {
+        k[len("transformer.") :] if k.startswith("transformer.") else k: v
+        for k, v in state.items()
+    }
     new_state = {}
     for key, value in state.items():
+        if key == "lm_head.weight":
+            continue
         new_key = "transformer." + key
         if new_key.endswith(".attn.bias"):
             continue
@@ -83,6 +90,29 @@ def convert(source: str, out_dir: str, num_experts: int, top_k: int):
     }
     for i in range(config.n_layer):
         expected_missing.add(f"transformer.h.{i}.moe.router.gate.weight")
+    for b in range(config.vision_depth):
+        expected_missing.update(
+            {
+                f"vision_tower.blocks.{b}.ln_1.weight",
+                f"vision_tower.blocks.{b}.ln_1.bias",
+                f"vision_tower.blocks.{b}.attn.in_proj_weight",
+                f"vision_tower.blocks.{b}.attn.in_proj_bias",
+                f"vision_tower.blocks.{b}.attn.out_proj.weight",
+                f"vision_tower.blocks.{b}.attn.out_proj.bias",
+                f"vision_tower.blocks.{b}.ln_2.weight",
+                f"vision_tower.blocks.{b}.ln_2.bias",
+                f"vision_tower.blocks.{b}.mlp.0.weight",
+                f"vision_tower.blocks.{b}.mlp.0.bias",
+                f"vision_tower.blocks.{b}.mlp.2.weight",
+                f"vision_tower.blocks.{b}.mlp.2.bias",
+            }
+        )
+    expected_missing.update(
+        {
+            "vision_tower.ln_post.weight",
+            "vision_tower.ln_post.bias",
+        }
+    )
     real_missing = [k for k in missing if k not in expected_missing]
     if real_missing:
         raise RuntimeError(f"missing keys: {real_missing}")

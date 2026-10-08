@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from transformers.cache_utils import DynamicCache
+from transformers import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
@@ -12,6 +14,22 @@ from transformers.utils import logging
 from .configuration_cortex_moe import CortexMoeConfig
 
 logger = logging.get_logger(__name__)
+
+
+class _Conv1D(nn.Module):
+    """GPT-2 style 1D convolution: weight layout is [in, out]."""
+
+    def __init__(self, nf, nx):
+        super().__init__()
+        self.nf = nf
+        self.weight = nn.Parameter(torch.empty(nx, nf))
+        self.bias = nn.Parameter(torch.zeros(nf))
+        nn.init.normal_(self.weight, std=0.02)
+
+    def forward(self, x):
+        size_out = x.size()[:-1] + (self.nf,)
+        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+        return x.view(size_out)
 
 
 def gelu_new(x: Tensor) -> Tensor:
@@ -49,11 +67,11 @@ class CortexMoeAttention(nn.Module):
         self.scale_attn_weights = True
         self.is_cross_attention = is_cross_attention
         if is_cross_attention:
-            self.c_attn = nn.Linear(self.embed_dim, 3 * self.embed_dim)
-            self.q_attn = nn.Linear(self.embed_dim, self.embed_dim)
+            self.c_attn = _Conv1D(3 * self.embed_dim, self.embed_dim)
+            self.q_attn = _Conv1D(self.embed_dim, self.embed_dim)
         else:
-            self.c_attn = nn.Linear(self.embed_dim, 3 * self.embed_dim)
-        self.c_proj = nn.Linear(self.embed_dim, self.embed_dim)
+            self.c_attn = _Conv1D(3 * self.embed_dim, self.embed_dim)
+        self.c_proj = _Conv1D(self.embed_dim, self.embed_dim)
         self.attn_dropout = nn.Dropout(config.resid_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
@@ -85,7 +103,8 @@ class CortexMoeAttention(nn.Module):
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values=None,
+        layer_idx: int = 0,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -109,23 +128,21 @@ class CortexMoeAttention(nn.Module):
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
 
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
+        if past_key_values is not None and encoder_hidden_states is None:
+            key, value = past_key_values.update(key, value, layer_idx)
 
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
+        present = past_key_values if use_cache else None
 
         if self.bias is not None and query.size(-2) == key.size(-2):
             query_length, key_length = query.size(-2), key.size(-2)
             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            min_value = torch.finfo(query.dtype).min
+            additive = torch.zeros_like(causal_mask, dtype=query.dtype).masked_fill(
+                ~causal_mask, min_value
+            )
             if attention_mask is not None:
-                attention_mask = attention_mask.to(query.dtype) + causal_mask.to(query.dtype)
-            else:
-                attention_mask = causal_mask.to(query.dtype)
+                additive = additive + (1.0 - attention_mask.to(query.dtype)) * min_value
+            attention_mask = additive
 
         attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
@@ -142,8 +159,8 @@ class CortexMoeMLP(nn.Module):
     def __init__(self, intermediate_size, config: CortexMoeConfig):
         super().__init__()
         embed_dim = config.n_embd
-        self.c_fc = nn.Linear(embed_dim, intermediate_size)
-        self.c_proj = nn.Linear(intermediate_size, embed_dim)
+        self.c_fc = _Conv1D(intermediate_size, embed_dim)
+        self.c_proj = _Conv1D(embed_dim, intermediate_size)
         self.act = ACT_FNS[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
 
@@ -192,6 +209,7 @@ class CortexMoeSparseMLP(nn.Module):
         self.config = config
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.capacity_factor = config.expert_capacity_factor
         self.router = CortexMoeRouter(config)
         self.experts = nn.ModuleList(
             [CortexMoeMLP(intermediate_size, config) for _ in range(self.num_experts)]
@@ -238,7 +256,8 @@ class CortexMoeBlock(nn.Module):
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values=None,
+        layer_idx: int = 0,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -250,7 +269,8 @@ class CortexMoeBlock(nn.Module):
         hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
             hidden_states,
-            layer_past=layer_past,
+            past_key_values=past_key_values,
+            layer_idx=layer_idx,
             attention_mask=attention_mask,
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
@@ -329,12 +349,11 @@ class CortexMoeModel(CortexMoePreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else True
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         if input_ids is not None:
-            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
             batch_size = input_ids.shape[0]
@@ -349,8 +368,19 @@ class CortexMoeModel(CortexMoePreTrainedModel):
         if position_ids is not None:
             position_ids = position_ids.view(-1, input_shape[-1])
 
-        if past_key_values is None:
-            past_key_values = tuple([None] * len(self.h))
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+
+        if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
+            past_length = past_key_values.get_seq_length()
+        elif (
+            isinstance(past_key_values, (tuple, list))
+            and len(past_key_values) > 0
+            and past_key_values[0] is not None
+        ):
+            past_length = past_key_values[0][0].size(-2)
+        else:
+            past_length = 0
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
@@ -362,8 +392,8 @@ class CortexMoeModel(CortexMoePreTrainedModel):
             token_type_embeds = 0
         if position_ids is None:
             position_ids = torch.arange(
-                past_key_values[0][0].size(-2) if past_key_values[0] is not None else 0,
-                input_shape[-1] + (past_key_values[0][0].size(-2) if past_key_values[0] is not None else 0),
+                past_length,
+                past_length + input_shape[-1],
                 dtype=torch.long,
                 device=inputs_embeds.device,
             )
@@ -372,17 +402,18 @@ class CortexMoeModel(CortexMoePreTrainedModel):
         hidden_states = self.drop(hidden_states)
         output_shape = input_shape + (hidden_states.size(-1),)
 
-        presents = () if use_cache else None
+        presents = past_key_values if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         aux_losses = []
         z_losses = []
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+        for i, block in enumerate(self.h):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             outputs = block(
                 hidden_states,
-                layer_past=layer_past,
+                past_key_values=past_key_values if use_cache else None,
+                layer_idx=i,
                 attention_mask=attention_mask,
                 head_mask=head_mask[i] if head_mask is not None else None,
                 encoder_hidden_states=encoder_hidden_states,
@@ -391,8 +422,6 @@ class CortexMoeModel(CortexMoePreTrainedModel):
                 output_attentions=output_attentions,
             )
             hidden_states = outputs[0]
-            if use_cache is True:
-                presents = presents + (outputs[1],)
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
             aux_losses.append(outputs[-2])
@@ -505,8 +534,8 @@ class CortexMoeVisionProjector(nn.Module):
         return self.proj(vision_features)
 
 
-class CortexMoeForCausalLM(CortexMoePreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+class CortexMoeForCausalLM(CortexMoePreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
 
     def __init__(self, config: CortexMoeConfig):
         super().__init__(config)
@@ -546,7 +575,7 @@ class CortexMoeForCausalLM(CortexMoePreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else True
         vision_tokens = None
         if pixel_values is not None:
             vision_features = self.vision_tower(pixel_values)
@@ -617,7 +646,13 @@ class CortexMoeForCausalLM(CortexMoePreTrainedModel):
         **kwargs,
     ):
         if past_key_values is not None:
-            if isinstance(past_key_values, (tuple, list)) and len(past_key_values) > 0:
+            if hasattr(past_key_values, "get_seq_length"):
+                past_length = past_key_values.get_seq_length()
+            elif (
+                isinstance(past_key_values, (tuple, list))
+                and len(past_key_values) > 0
+                and past_key_values[0] is not None
+            ):
                 past_length = past_key_values[0][0].size(-2)
             else:
                 past_length = 0
@@ -641,6 +676,9 @@ class CortexMoeForCausalLM(CortexMoePreTrainedModel):
         return model_inputs
 
     def _reorder_cache(self, past_key_values, beam_idx):
+        if hasattr(past_key_values, "reorder_cache"):
+            past_key_values.reorder_cache(beam_idx)
+            return past_key_values
         return tuple(
             tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
             for layer_past in past_key_values

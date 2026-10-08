@@ -36,6 +36,7 @@ class CortexMoeConfig(PretrainedConfig):
         max_image_tokens=64,
         **kwargs,
     ):
+        kwargs.setdefault("tie_word_embeddings", True)
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
