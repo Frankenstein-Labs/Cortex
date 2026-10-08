@@ -47,14 +47,6 @@ ACT_FNS = {
 class CortexMoeAttention(nn.Module):
     def __init__(self, config: CortexMoeConfig, is_cross_attention=False):
         super().__init__()
-        max_positions = config.n_positions
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)).view(
-                1, 1, max_positions, max_positions
-            ),
-            persistent=False,
-        )
         self.embed_dim = config.n_embd
         self.num_heads = config.n_head
         self.head_dim = self.embed_dim // self.num_heads
@@ -128,21 +120,20 @@ class CortexMoeAttention(nn.Module):
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
 
+        if attention_mask is None:
+            query_length, key_length = query.size(-2), key.size(-2)
+            min_value = torch.finfo(query.dtype).min
+            causal_mask = torch.tril(
+                torch.ones((query_length, key_length), dtype=torch.bool, device=query.device)
+            )
+            attention_mask = torch.zeros(
+                (query_length, key_length), dtype=query.dtype, device=query.device
+            ).masked_fill(~causal_mask, min_value)
+
         if past_key_values is not None and encoder_hidden_states is None:
             key, value = past_key_values.update(key, value, layer_idx)
 
         present = past_key_values if use_cache else None
-
-        if self.bias is not None and query.size(-2) == key.size(-2):
-            query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-            min_value = torch.finfo(query.dtype).min
-            additive = torch.zeros_like(causal_mask, dtype=query.dtype).masked_fill(
-                ~causal_mask, min_value
-            )
-            if attention_mask is not None:
-                additive = additive + (1.0 - attention_mask.to(query.dtype)) * min_value
-            attention_mask = additive
 
         attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
